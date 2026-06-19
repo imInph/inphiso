@@ -175,7 +175,7 @@ check_deps() {
     [[ "${_ans,,}" == "y" ]] || die "Aborted. Install the missing tools and re-run."
 
     # shellcheck disable=SC2086  # word-split on install_cmd is intentional
-    sudo sh -c "$install_cmd" || die "Installation failed. Install missing tools manually and re-run."
+    sh -c "$install_cmd" || die "Installation failed. Install missing tools manually and re-run."
 
     # Re-verify
     local still_missing=()
