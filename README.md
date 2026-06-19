@@ -26,6 +26,10 @@ different (they're hybrid images), so those just get written raw.
 - Shows you the target drive's size, model, and partitions, and makes you type
   `YES` before writing anything. The system disk isn't even in the list.
 - Cleans up after itself if something goes wrong, so no leftover mounts.
+- Flashing a Windows ISO with an install.wim over 4 GiB needs wimlib installed
+  first (`wimtools` on Debian/Ubuntu, `wimlib` on Arch/Fedora). If it's missing,
+  the script stops and tells you, but only after partitioning, so you'd redo the
+  flash.
 
 ## Boot support
 
