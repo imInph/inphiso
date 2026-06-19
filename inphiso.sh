@@ -47,14 +47,18 @@ ISO_TYPE=""      # "windows" | "linux"
 ISO_MOUNT=""     # set when ISO is mounted
 USB_MNT=""       # set when USB partition is mounted
 PROBE_MOUNT=""   # set during ISO type detection probe
+WIN_FLASH_OK=""  # set to 1 only after flash_windows completes every step
 
 # ── Cleanup ───────────────────────────────────────────────────────────────────
 cleanup() {
     local code=$?
     set +e   # don't abort inside cleanup
-    [[ -n "$USB_MNT"    && -d "$USB_MNT"    ]] && { umount "$USB_MNT"    2>/dev/null; rmdir "$USB_MNT"    2>/dev/null; }
-    [[ -n "$ISO_MOUNT"  && -d "$ISO_MOUNT"  ]] && { umount "$ISO_MOUNT"  2>/dev/null; rmdir "$ISO_MOUNT"  2>/dev/null; }
-    [[ -n "$PROBE_MOUNT" && -d "$PROBE_MOUNT" ]] && { umount "$PROBE_MOUNT" 2>/dev/null; rmdir "$PROBE_MOUNT" 2>/dev/null; }
+    local _mp
+    for _mp in "$USB_MNT" "$ISO_MOUNT" "$PROBE_MOUNT"; do
+        [[ -n "$_mp" && -d "$_mp" ]] || continue
+        mountpoint -q "$_mp" 2>/dev/null && umount "$_mp" 2>/dev/null
+        rmdir "$_mp" 2>/dev/null
+    done
     if [[ $code -ne 0 && $code -ne 130 ]]; then
         printf '\n%b  Exited with error %d. The USB may be in an unusable state.%b\n' \
             "$RED" "$code" "$NC" >&2
@@ -267,7 +271,7 @@ select_drive() {
     root_disk="$(get_root_disk)"
 
     local -a _all_names
-    mapfile -t _all_names < <(lsblk -d -o NAME --noheadings | grep -v '^loop')
+    mapfile -t _all_names < <(lsblk -d -o NAME --noheadings | grep -v '^loop' || true)
     [[ ${#_all_names[@]} -gt 0 ]] || die "No drives detected."
 
     local -a eligible=()
@@ -473,7 +477,7 @@ flash_windows() {
         warn "install.wim is $(( wim_size / 1024 / 1024 )) MiB — exceeds the FAT32 4 GiB limit."
         have_wimlib || die "wimlib-imagex is required to split install.wim. Install it and re-run."
         info "Copying all files except install.wim..."
-        rsync -a --progress --exclude='/sources/install.wim' "${ISO_MOUNT}/" "${USB_MNT}/"
+        rsync -rt --no-owner --no-group --no-perms --progress --exclude='/sources/install.wim' "${ISO_MOUNT}/" "${USB_MNT}/"
 
         local dest_src="${USB_MNT}/sources"
         mkdir -p "$dest_src"
@@ -482,7 +486,7 @@ flash_windows() {
         wimlib-imagex split "$wim_path" "${dest_src}/install.swm" 3800
         ok "install.wim split successfully."
     else
-        rsync -a --progress "${ISO_MOUNT}/" "${USB_MNT}/"
+        rsync -rt --no-owner --no-group --no-perms --progress "${ISO_MOUNT}/" "${USB_MNT}/"
     fi
     step=$(( step + 1 ))
 
@@ -491,11 +495,7 @@ flash_windows() {
     sync
     umount "$USB_MNT";  rmdir "$USB_MNT";  USB_MNT=""
     umount "$ISO_MOUNT"; rmdir "$ISO_MOUNT"; ISO_MOUNT=""
-
-    printf '\n%b%b  Done! Windows USB is ready.%b\n' "$GREEN" "$BOLD" "$NC"
-    printf '%b  Boot modes: Legacy BIOS (MBR) + UEFI (EFI/BOOT on FAT32 — firmware-dependent).%b\n' \
-        "$GRAY" "$NC"
-    printf '%b  Safely remove the drive.%b\n\n' "$GRAY" "$NC"
+    WIN_FLASH_OK=1
 }
 
 # ── Flash: Linux / hybrid ISO path ───────────────────────────────────────────
@@ -541,7 +541,14 @@ confirm
 detect_iso_type
 
 case "$ISO_TYPE" in
-    windows) flash_windows ;;
+    windows)
+        flash_windows
+        [[ "${WIN_FLASH_OK}" == "1" ]] || die "Internal error: flash_windows returned without setting WIN_FLASH_OK."
+        printf '\n%b%b  Done! Windows USB is ready.%b\n' "$GREEN" "$BOLD" "$NC"
+        printf '%b  Boot modes: Legacy BIOS (MBR) + UEFI (EFI/BOOT on FAT32 — firmware-dependent).%b\n' \
+            "$GRAY" "$NC"
+        printf '%b  Safely remove the drive.%b\n\n' "$GRAY" "$NC"
+        ;;
     linux)   flash_linux   ;;
     *)       die "Internal error: unknown ISO type '${ISO_TYPE}'." ;;
 esac
