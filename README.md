@@ -1,6 +1,7 @@
 # inphiso
 
-A single Bash script that flashes Windows and Linux ISOs to USB drives. It
+A single Bash script that flashes Windows and Linux disk images to USB drives.
+It
 handles the stuff that usually breaks: Windows ISOs from Linux, oversized
 `install.wim` files, and the FAT32 4 GiB limit that trips up `dd` and plain
 file copies.
@@ -16,8 +17,14 @@ different (they're hybrid images), so those just get written raw.
 
 ## What it does
 
-- Figures out if the ISO is Windows or Linux and picks the right method. If it
-  genuinely can't tell, it asks instead of guessing.
+- Lists `.iso`, `.img`, `.raw`, `.dd` and `.usb` files in the current directory,
+  plain or compressed (`.img.xz`, `.img.gz`, `.img.bz2`, `.img.zst`), with an
+  `Exit` option at the end of the file and drive pickers if you change your mind.
+- Streams compressed images through `xz` / `gzip` / `bzip2` / `zstd` straight
+  into `dd`, so nothing gets unpacked to your disk first.
+- Figures out if the image is Windows or Linux and picks the right method. If it
+  genuinely can't tell — including raw `.img` files, which can't be mounted and
+  inspected at all — it asks instead of guessing.
 - Splits `install.wim` into `.swm` files with `wimlib-imagex` when it's too big
   for FAT32.
 - Checks for the tools it needs up front, works out your package manager
@@ -26,10 +33,6 @@ different (they're hybrid images), so those just get written raw.
 - Shows you the target drive's size, model, and partitions, and makes you type
   `YES` before writing anything. The system disk isn't even in the list.
 - Cleans up after itself if something goes wrong, so no leftover mounts.
-- Flashing a Windows ISO with an install.wim over 4 GiB needs wimlib installed
-  first (`wimtools` on Debian/Ubuntu, `wimlib` on Arch/Fedora). If it's missing,
-  the script stops and tells you, but only after partitioning, so you'd redo the
-  flash.
 
 ## Boot support
 
@@ -60,8 +63,19 @@ chmod +x inphiso.sh
 sudo ./inphiso.sh
 ```
 
-From there it's interactive: pick an ISO, pick the drive, check the summary,
-type `YES`.
+From there it's interactive: pick an image, pick the drive, check the summary,
+type `YES`. Both pickers have an `Exit` entry as the last option.
+
+Raw images (`.img`, `.raw`) are written with `dd`, same as a hybrid ISO. The
+Windows path needs a real, uncompressed ISO, since it mounts the image and
+copies files out of it.
+
+Compressed images are detected by their magic bytes, not their filename, and
+decompressed on the fly as they're written. If the decompressor isn't installed
+it offers to install it, same as the other tools. One caveat: `xz` records the
+uncompressed size, so it can check the image against the drive before writing,
+but `gzip`, `bzip2` and `zstd` don't — with those, a too-big image isn't caught
+until `dd` runs out of room partway through.
 
 ## Heads-up
 

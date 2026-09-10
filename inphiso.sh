@@ -1,6 +1,14 @@
 #!/usr/bin/env bash
 # =============================================================================
-# inphiso.sh - flash Windows or Linux ISOs to a USB drive
+# inphiso.sh - flash Windows or Linux disk images to a USB drive
+#
+# Input images:
+#   The picker lists .iso, .img, .raw, .dd and .usb files, plain or compressed
+#   with xz / gzip / bzip2 / zstd (.img.xz and friends). Windows mode needs a
+#   mountable ISO; anything that can't be loop-mounted (raw .img/.raw images
+#   carry a partition table, not a filesystem, and compressed files can't be
+#   mounted at all) goes down the raw dd path. Compressed images are streamed
+#   through the decompressor into dd, never unpacked to disk first.
 #
 # Boot support:
 #   Windows ISOs: works on Legacy BIOS (MBR boot flag on a single FAT32
@@ -48,6 +56,7 @@ ISO_MOUNT=""     # set when ISO is mounted
 USB_MNT=""       # set when USB partition is mounted
 PROBE_MOUNT=""   # set during ISO type detection probe
 WIN_FLASH_OK=""  # set to 1 only after flash_windows completes every step
+COMPRESSION=""   # "" | xz | gzip | bzip2 | zstd — set in select_file()
 
 # ── Cleanup ───────────────────────────────────────────────────────────────────
 cleanup() {
@@ -210,16 +219,100 @@ have_wimlib() {
     return 1
 }
 
-# ── ISO file selection ────────────────────────────────────────────────────────
+# ── Compressed images ─────────────────────────────────────────────────────────
+# Base extensions the picker lists. .iso is a filesystem image, so it gets
+# probed and mounted; .img/.raw/.dd/.usb are usually raw whole-disk images that
+# can't be mounted directly — those fall back to asking in detect_iso_type().
+IMAGE_EXTS=(iso img raw dd usb)
+# Compression suffixes stacked on top of those (armbian.img.xz, rpi.img.gz, ...).
+# Streamed straight into dd, so the image is never unpacked to disk first.
+COMPRESS_EXTS=(xz gz bz2 zst)
+
+# Print the compression format from the file's magic bytes, or "" if it isn't
+# compressed. Magic beats the extension: a mislabelled file still works.
+detect_compression() {
+    local magic
+    magic=$(od -An -tx1 -N6 "$1" 2>/dev/null | tr -d ' \n')
+    case "$magic" in
+        fd377a585a00*) printf 'xz'    ;;
+        1f8b*)         printf 'gzip'  ;;
+        425a68*)       printf 'bzip2' ;;
+        28b52ffd*)     printf 'zstd'  ;;
+        *)             printf ''      ;;
+    esac
+}
+
+# Print the binary that decompresses a given format.
+_decomp_bin() {
+    case "$1" in
+        xz)    printf 'xz'    ;;
+        gzip)  printf 'gzip'  ;;
+        bzip2) printf 'bzip2' ;;
+        zstd)  printf 'zstd'  ;;
+    esac
+}
+
+# Make sure the decompressor for $1 is installed. Same offer-then-install shape
+# as check_deps, but for one conditional tool, like have_wimlib.
+ensure_decompressor() {
+    local comp="$1" bin pkgmgr pkg install_cmd
+    bin="$(_decomp_bin "$comp")"
+    command -v "$bin" &>/dev/null && return 0
+
+    pkgmgr="$(detect_pkg_manager)"
+    pkg="$bin"
+    [[ "$comp" == "xz" && "$pkgmgr" == "apt" ]] && pkg="xz-utils"
+
+    if [[ "$pkgmgr" == "unknown" ]]; then
+        die "Need ${bin} to decompress this image, and no supported package manager was found.\n  Install ${bin} manually and re-run."
+    fi
+
+    install_cmd="$(install_cmd_for "$pkgmgr" "$pkg")"
+    printf '\n%b  %s is needed to decompress this image, and it is not installed.%b\n' \
+        "$YELLOW" "$bin" "$NC"
+    printf '%b  Command that will run (with sudo):%b sudo %s\n\n' "$YELLOW" "$NC" "$install_cmd"
+    printf '  Proceed with installation? [y/N] '
+    read -r _ans
+    [[ "${_ans,,}" == "y" ]] || die "Aborted. Install ${bin} and re-run."
+
+    sh -c "$install_cmd" || die "Installation failed. Install ${bin} manually and re-run."
+    command -v "$bin" &>/dev/null || die "Still missing after install: ${bin}"
+    ok "${bin} installed."
+}
+
+# Print the uncompressed size in bytes, or "" when the format doesn't record it.
+# gzip only stores the size modulo 4 GiB and bzip2 stores nothing, so for those
+# the size check is skipped rather than done on a number that could be wrong.
+uncompressed_size() {
+    case "$COMPRESSION" in
+        "")  stat -c%s "$1" ;;
+        xz)  xz --robot --list "$1" 2>/dev/null \
+                 | awk -F'\t' '($1 == "file" || $1 == "totals") && $5 ~ /^[0-9]+$/ { print $5; exit }' ;;
+        *)   printf '' ;;
+    esac
+}
+
+# ── Image file selection ──────────────────────────────────────────────────────
 select_file() {
     banner
-    printf '%b%b  ISO files in current directory:%b\n\n' "$WHITE" "$BOLD" "$NC"
+    printf '%b%b  Disk images in current directory:%b\n\n' "$WHITE" "$BOLD" "$NC"
+
+    # Build: -iname "*.iso" -o -iname "*.iso.xz" -o ... -o -iname "*.img" -o ...
+    local -a _name_expr=()
+    local _ext _pat
+    for _ext in "${IMAGE_EXTS[@]}"; do
+        # "iso" plus "iso.xz", "iso.gz", ... (prefix-expands COMPRESS_EXTS)
+        for _pat in "$_ext" "${COMPRESS_EXTS[@]/#/${_ext}.}"; do
+            [[ ${#_name_expr[@]} -gt 0 ]] && _name_expr+=(-o)
+            _name_expr+=(-iname "*.${_pat}")
+        done
+    done
 
     local -a _all_files
-    mapfile -t _all_files < <(find "$(pwd)" -maxdepth 1 -type f -iname "*.iso" | sort)
+    mapfile -t _all_files < <(find "$(pwd)" -maxdepth 1 -type f \( "${_name_expr[@]}" \) | sort)
 
     if [[ ${#_all_files[@]} -eq 0 ]]; then
-        warn "No .iso files found — showing all files instead."
+        warn "No image files found (${IMAGE_EXTS[*]}, plain or ${COMPRESS_EXTS[*]}-compressed) — showing all files instead."
         mapfile -t _all_files < <(find "$(pwd)" -maxdepth 1 -type f | sort)
     fi
 
@@ -234,19 +327,37 @@ select_file() {
             "$GRAY" "$_sz" "$NC"
     done
 
+    local _exit_opt=$(( ${#_all_files[@]} + 1 ))
+    printf '  %b[%2d]%b  %bExit%b\n' "$CYAN" "$_exit_opt" "$NC" "$GRAY" "$NC"
+
     printf '\n  %bWhich file do you want to flash?%b\n  > ' "$YELLOW" "$NC"
     read -r _choice
 
     if ! [[ "$_choice" =~ ^[0-9]+$ ]] \
        || [[ "$_choice" -lt 1 ]] \
-       || [[ "$_choice" -gt "${#_all_files[@]}" ]]; then
+       || [[ "$_choice" -gt "$_exit_opt" ]]; then
         die "Invalid selection."
+    fi
+
+    if [[ "$_choice" -eq "$_exit_opt" ]]; then
+        printf '\n%b  Exiting. Nothing was written.%b\n\n' "$CYAN" "$NC"
+        exit 0
     fi
 
     ISO_FILE="${_all_files[$(( _choice - 1 ))]}"
     [[ -f "$ISO_FILE" && -r "$ISO_FILE" ]] || die "File is not readable: ${ISO_FILE}"
 
+    COMPRESSION="$(detect_compression "$ISO_FILE")"
+
     ok "Selected: $(basename "$ISO_FILE")"
+
+    if [[ -n "$COMPRESSION" ]]; then
+        info "Compressed image (${COMPRESSION}) — it gets decompressed as it's written."
+        printf '%b  A Windows installer would have to be unpacked first, since Windows mode\n' "$GRAY"
+        printf '  copies files out of a mounted ISO. Raw images are fine compressed.%b\n' "$NC"
+        ensure_decompressor "$COMPRESSION"
+    fi
+
     sleep 1
 }
 
@@ -295,6 +406,9 @@ select_drive() {
             "$name" "$_size" "$_model" "$_rem_tag"
     done
 
+    local _exit_opt=$(( ${#eligible[@]} + 1 ))
+    printf '  %b[%2d]%b  %bExit%b\n' "$CYAN" "$_exit_opt" "$NC" "$GRAY" "$NC"
+
     printf '\n  %b%b  ! WARNING: The selected drive will be completely erased !%b\n\n' \
         "$RED" "$BOLD" "$NC"
     printf '  %bWhich drive?%b\n  > ' "$YELLOW" "$NC"
@@ -302,8 +416,13 @@ select_drive() {
 
     if ! [[ "$_choice" =~ ^[0-9]+$ ]] \
        || [[ "$_choice" -lt 1 ]] \
-       || [[ "$_choice" -gt "${#eligible[@]}" ]]; then
+       || [[ "$_choice" -gt "$_exit_opt" ]]; then
         die "Invalid selection."
+    fi
+
+    if [[ "$_choice" -eq "$_exit_opt" ]]; then
+        printf '\n%b  Exiting. Nothing was written.%b\n\n' "$CYAN" "$NC"
+        exit 0
     fi
 
     local chosen="${eligible[$(( _choice - 1 ))]}"
@@ -335,7 +454,9 @@ confirm() {
     _drv_sz=$(lsblk -dn -o SIZE "$USB_DEV" 2>/dev/null || printf '?')
     _drv_model=$(lsblk -dn -o MODEL "$USB_DEV" 2>/dev/null | xargs 2>/dev/null || printf 'unknown')
 
-    printf '  %bISO  :%b %s  (%s)\n' "$CYAN" "$NC" "$(basename "$ISO_FILE")" "$_iso_sz"
+    local _comp_tag=""
+    [[ -n "$COMPRESSION" ]] && _comp_tag=", ${COMPRESSION}-compressed"
+    printf '  %bImage:%b %s  (%s%s)\n' "$CYAN" "$NC" "$(basename "$ISO_FILE")" "$_iso_sz" "$_comp_tag"
     printf '  %bDrive:%b %s  %s  %s\n\n' "$CYAN" "$NC" "$USB_DEV" "$_drv_sz" "$_drv_model"
     printf '  %bCurrent partitions on %s:%b\n' "$CYAN" "$USB_DEV" "$NC"
     lsblk "$USB_DEV" 2>/dev/null || true
@@ -354,10 +475,29 @@ confirm() {
 
 # ── ISO type detection ────────────────────────────────────────────────────────
 detect_iso_type() {
-    info "Probing ISO type..."
+    # A compressed image can't be mounted, and the Windows path needs to mount
+    # one, so the raw dd path is the only thing that can write it. Said so at
+    # selection time, before anything was confirmed.
+    if [[ -n "$COMPRESSION" ]]; then
+        ISO_TYPE="linux"
+        info "Compressed image (${COMPRESSION}) — writing it raw, decompressed on the fly."
+        return
+    fi
+
+    info "Probing image type..."
     PROBE_MOUNT="$(mktemp -d /tmp/iso_probe.XXXXXX)"
-    mount -o loop,ro "$ISO_FILE" "$PROBE_MOUNT" \
-        || die "Cannot mount ISO for inspection. Is it a valid ISO image?"
+    # Raw images (.img/.raw) hold a partition table, not a filesystem, so a loop
+    # mount of the whole file fails. That's not fatal — just ask instead.
+    if ! mount -o loop,ro "$ISO_FILE" "$PROBE_MOUNT" 2>/dev/null; then
+        rmdir "$PROBE_MOUNT" 2>/dev/null || true
+        PROBE_MOUNT=""
+        warn "Can't mount this image, so its contents can't be inspected."
+        printf '%b  That is normal for raw disk images (.img, .raw) — they get written\n' "$GRAY"
+        printf '  raw, same as a hybrid ISO. Pick Linux/generic unless you know this is\n'
+        printf '  a Windows installer image.%b\n' "$NC"
+        _prompt_iso_type
+        return
+    fi
 
     local is_win=0 is_linux=0
 
@@ -392,9 +532,9 @@ detect_iso_type() {
         ISO_TYPE="linux";   info "Detected: Linux/hybrid ISO"
     else
         if [[ $is_win -eq 1 && $is_linux -eq 1 ]]; then
-            warn "ISO has markers for both Windows and Linux."
+            warn "Image has markers for both Windows and Linux."
         else
-            warn "Could not determine ISO type from contents."
+            warn "Could not determine image type from contents."
         fi
         _prompt_iso_type
     fi
@@ -439,7 +579,8 @@ flash_windows() {
 
     # 2 — Mount ISO
     printf '%b[%d/%d]%b Mounting ISO...\n' "$CYAN" "$step" "$total" "$NC"
-    mount -o loop,ro "$ISO_FILE" "$ISO_MOUNT" || die "Failed to mount ISO."
+    mount -o loop,ro "$ISO_FILE" "$ISO_MOUNT" \
+        || die "Failed to mount image. Windows mode needs a mountable ISO."
     step=$(( step + 1 ))
 
     # 3 — Partition
@@ -501,18 +642,24 @@ flash_windows() {
 # ── Flash: Linux / hybrid ISO path ───────────────────────────────────────────
 flash_linux() {
     local iso_bytes drv_bytes
-    iso_bytes=$(stat -c%s "$ISO_FILE")
+    iso_bytes="$(uncompressed_size "$ISO_FILE")"
     drv_bytes=$(blockdev --getsize64 "$USB_DEV")
 
-    if [[ $iso_bytes -gt $drv_bytes ]]; then
-        die "ISO ($(( iso_bytes / 1024 / 1024 )) MiB) is larger than the target drive" \
+    if [[ -z "$iso_bytes" ]]; then
+        warn "A ${COMPRESSION} file doesn't record its uncompressed size, so it can't be checked against the drive up front."
+        printf '%b  If it turns out to be too big, the write fails partway through and the\n' "$GRAY"
+        printf '  drive is left unbootable — nothing is lost except the time.%b\n' "$NC"
+    elif [[ $iso_bytes -gt $drv_bytes ]]; then
+        die "Image ($(( iso_bytes / 1024 / 1024 )) MiB) is larger than the target drive" \
             "($(( drv_bytes / 1024 / 1024 )) MiB)."
     fi
 
     _unmount_device "$USB_DEV"
 
-    printf '%b[1/2]%b Writing ISO to %s %b(this may take several minutes)%b...\n' \
-        "$CYAN" "$NC" "$USB_DEV" "$GRAY" "$NC"
+    local _what="image"
+    [[ -n "$COMPRESSION" ]] && _what="decompressed image"
+    printf '%b[1/2]%b Writing %s to %s %b(this may take several minutes)%b...\n' \
+        "$CYAN" "$NC" "$_what" "$USB_DEV" "$GRAY" "$NC"
 
     local -a dd_opts=(bs=4M conv=fsync)
     # status=progress is available in GNU coreutils dd >= 8.24
@@ -520,7 +667,12 @@ flash_linux() {
         dd_opts+=(status=progress)
     fi
 
-    dd if="$ISO_FILE" of="$USB_DEV" "${dd_opts[@]}"
+    if [[ -n "$COMPRESSION" ]]; then
+        # pipefail (set at the top) makes a failing decompressor fail the write
+        "$(_decomp_bin "$COMPRESSION")" -dc "$ISO_FILE" | dd of="$USB_DEV" "${dd_opts[@]}"
+    else
+        dd if="$ISO_FILE" of="$USB_DEV" "${dd_opts[@]}"
+    fi
 
     printf '%b[2/2]%b Syncing...\n' "$CYAN" "$NC"
     sync
